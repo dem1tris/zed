@@ -1456,6 +1456,29 @@ impl RefMenuEntry {
     }
 }
 
+// GPUI's default scroll handlers run before bubble listeners. Keep track of
+// actual movement after clamping, so one event never moves both scroll regions
+// and events at a boundary can still reach the parent.
+fn div_with_scroll_chaining(scroll_handle: ScrollHandle) -> Div {
+    let previous_offset = Rc::new(Cell::new(scroll_handle.offset()));
+    div()
+        .on_children_prepainted({
+            let scroll_handle = scroll_handle.clone();
+            let previous_offset = previous_offset.clone();
+            move |_, _, _| previous_offset.set(scroll_handle.offset())
+        })
+        .on_scroll(move |_, _, cx| {
+            let max_offset = scroll_handle.max_offset();
+            let offset = scroll_handle
+                .offset()
+                .clamp(&point(-max_offset.x, -max_offset.y), &point(px(0.), px(0.)));
+            scroll_handle.set_offset(offset);
+            if previous_offset.replace(offset) != offset {
+                cx.stop_propagation();
+            }
+        })
+}
+
 struct DetailPanelCommitMessage {
     sha: Oid,
     message: Entity<Markdown>,
@@ -1487,6 +1510,7 @@ pub struct GitGraph {
     _selected_commit_message_task: Option<Task<()>>,
     commit_details_split_state: Entity<SplitState>,
     repo_id: RepositoryId,
+    commit_details_scroll_handle: ScrollHandle,
     changed_files_scroll_handle: UniformListScrollHandle,
     changed_files_view_mode: ChangedFilesViewMode,
     commit_details_metadata_collapsed: bool,
@@ -1759,6 +1783,7 @@ impl GitGraph {
             log_order,
             commit_details_split_state: cx.new(|_cx| SplitState::new()),
             repo_id,
+            commit_details_scroll_handle: ScrollHandle::new(),
             changed_files_scroll_handle: UniformListScrollHandle::new(),
             changed_files_view_mode: ChangedFilesViewMode::default(),
             commit_details_metadata_collapsed: false,
@@ -2380,6 +2405,8 @@ impl GitGraph {
         }
 
         self.selected_entry_idx = Some(idx);
+        self.commit_details_scroll_handle
+            .set_offset(point(px(0.), px(0.)));
         self.selected_commit_diff = None;
         self.selected_commit_diff_stats = None;
         self.changed_files_expanded_dirs.clear();
@@ -3162,9 +3189,19 @@ impl GitGraph {
                 cx.notify();
             }));
 
+        let changed_files_scroll_handle = self
+            .changed_files_scroll_handle
+            .0
+            .borrow()
+            .base_handle
+            .clone();
+
         v_flex()
+            .id("commit-detail-panel")
             .min_w(px(300.))
             .h_full()
+            .overflow_y_scroll()
+            .track_scroll(&self.commit_details_scroll_handle)
             .bg(cx.theme().colors().editor_background)
             .flex_basis(DefiniteLength::Fraction(
                 self.commit_details_split_state.read(cx).right_ratio(),
@@ -3429,6 +3466,7 @@ impl GitGraph {
             .child(
                 v_flex()
                     .min_w_0()
+                    .min_h(gpui::rems(6.))
                     .flex_1()
                     .overflow_hidden()
                     .child(
@@ -3465,7 +3503,7 @@ impl GitGraph {
                             )),
                     )
                     .child(
-                        div()
+                        div_with_scroll_chaining(changed_files_scroll_handle)
                             .id("changed-files-container")
                             .flex_1()
                             .min_h_0()
@@ -3560,20 +3598,25 @@ impl GitGraph {
             )
             .child(Divider::horizontal())
             .child(
-                h_flex().p_1p5().w_full().child(
-                    Button::new("view-commit", "View Commit")
-                        .full_width()
-                        .start_icon(
-                            Icon::new(IconName::GitCommit)
-                                .size(IconSize::Small)
-                                .color(Color::Muted),
-                        )
-                        .style(ButtonStyle::OutlinedGhost)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_selected_commit_view(window, cx);
-                        })),
-                ),
+                h_flex()
+                    .p_1p5()
+                    .w_full()
+                    .debug_selector(|| "view-commit-footer".to_owned())
+                    .child(
+                        Button::new("view-commit", "View Commit")
+                            .full_width()
+                            .start_icon(
+                                Icon::new(IconName::GitCommit)
+                                    .size(IconSize::Small)
+                                    .color(Color::Muted),
+                            )
+                            .style(ButtonStyle::OutlinedGhost)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_selected_commit_view(window, cx);
+                            })),
+                    ),
             )
+            .vertical_scrollbar_for(&self.commit_details_scroll_handle, window, cx)
             .into_any_element()
     }
 
@@ -4310,18 +4353,14 @@ impl GitGraph {
 
         let collapsed = self.commit_details_message_collapsed;
 
-        div()
-            // Using grid over flexbox because the structure of this side
-            // panel prvents taffy from calculating a concrete width correctly,
-            // which causes problems with text reflow when using flexbox.
-            // grid, on the other hand, doesn't appear to give taffy the same
-            // problems.
+        v_flex()
             .w_full()
             .py_2()
             .pl_2()
-            .grid()
-            .grid_cols(1)
             .gap_1()
+            .when(!collapsed, |this| {
+                this.min_h(line_height * 2. + rem_size * 1.25)
+            })
             .child(
                 h_flex()
                     .w_full()
@@ -4354,11 +4393,16 @@ impl GitGraph {
                     div()
                         .relative()
                         .w_full()
+                        .min_h_0()
+                        .grid()
+                        .grid_cols(1)
+                        .grid_rows(1)
                         .child(
-                            div()
+                            div_with_scroll_chaining(scroll_handle.clone())
                                 .id("commit-message")
                                 .text_sm()
                                 .w_full()
+                                .min_h_0()
                                 .max_h(line_height * 12.)
                                 .overflow_y_scroll()
                                 .track_scroll(scroll_handle)
@@ -4757,7 +4801,7 @@ impl Render for GitGraph {
                 v_flex()
                     .size_full()
                     .child(self.render_search_bar(cx))
-                    .child(div().flex_1().child(content)),
+                    .child(div().flex_1().min_h_0().child(content)),
             )
             .children(self.context_menu.as_ref().map(|context_menu| {
                 deferred(
@@ -8611,7 +8655,7 @@ mod tests {
 
         cx.draw(
             point(px(0.), px(0.)),
-            gpui::size(px(1200.), px(800.)),
+            gpui::size(px(1200.), px(400.)),
             |_, _| git_graph.clone().into_any_element(),
         );
         cx.run_until_parked();
@@ -8638,6 +8682,11 @@ mod tests {
         let changed_files_bounds = changed_files_scroll_handle.0.borrow().base_handle.bounds();
 
         assert!(
+            changed_files_bounds.size.height >= px(24.)
+                && changed_files_bounds.bottom() <= px(400.),
+            "changed files should remain visible in a short pane: {changed_files_bounds:?}",
+        );
+        assert!(
             message_bounds.size.height <= maximum_message_height,
             "commit message viewport height ({}) should not exceed its maximum ({})",
             message_bounds.size.height,
@@ -8651,6 +8700,405 @@ mod tests {
             message_bounds.bottom() <= changed_files_bounds.top(),
             "commit message viewport {message_bounds:?} should not overlap changed files {changed_files_bounds:?}"
         );
+    }
+
+    #[gpui::test]
+    async fn test_commit_message_viewport_adapts_to_pane_height(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            Path::new("/project"),
+            json!({ ".git": {}, "file.txt": "content" }),
+        )
+        .await;
+
+        let commit_sha = Oid::from_bytes(&[1; 20]).expect("commit SHA should be valid");
+        let commits = vec![Arc::new(InitialGraphCommitData {
+            sha: commit_sha,
+            parents: smallvec![],
+            ref_names: vec!["HEAD -> main".into()],
+        })];
+        fs.set_graph_commits(Path::new("/project/.git"), commits);
+
+        let message = (0..40)
+            .map(|line_number| {
+                format!(
+                    "Line {line_number}: This commit message is long enough to require scrolling."
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        fs.set_commit_data(
+            Path::new("/project/.git"),
+            [(
+                CommitData {
+                    sha: commit_sha,
+                    parents: smallvec![],
+                    author_name: "Author".into(),
+                    author_email: "author@example.com".into(),
+                    commit_timestamp: 1_700_000_000,
+                    subject: "Long commit message".into(),
+                    message: message.into(),
+                },
+                false,
+            )],
+        );
+
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+        cx.run_until_parked();
+
+        let repository = project.read_with(cx, |project, cx| {
+            project
+                .active_repository(cx)
+                .expect("should have a repository")
+        });
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace_weak =
+            multi_workspace.read_with(&*cx, |multi, _| multi.workspace().downgrade());
+        let git_graph = cx.new_window_entity(|window, cx| {
+            GitGraph::new(
+                repository.read(cx).id,
+                project.read(cx).git_store().clone(),
+                workspace_weak,
+                None,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        git_graph.update_in(cx, |graph, window, cx| {
+            graph.select_first(&menu::SelectFirst, window, cx);
+        });
+        cx.run_until_parked();
+
+        git_graph.update(cx, |graph, cx| {
+            graph.selected_commit_diff = Some(CommitDiff {
+                files: vec![CommitFile {
+                    path: RepoPath::new("file.txt").expect("repository path should be valid"),
+                    old_text: Some("content".into()),
+                    new_text: Some("updated content".into()),
+                    is_binary: false,
+                }],
+                is_shallow_boundary: false,
+            });
+            graph.selected_commit_diff_stats = Some((1, 1));
+            cx.notify();
+        });
+
+        struct GraphTestView(Entity<GitGraph>);
+
+        impl Render for GraphTestView {
+            fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+                self.0.clone()
+            }
+        }
+
+        cx.replace_root_view(|_, _| GraphTestView(git_graph.clone()));
+        cx.run_until_parked();
+
+        let (message_scroll_handle, changed_files_scroll_handle) =
+            git_graph.read_with(&*cx, |graph, _| {
+                (
+                    graph
+                        .selected_commit_message
+                        .as_ref()
+                        .expect("selected commit message should be loaded")
+                        .scroll_handle
+                        .clone(),
+                    graph.changed_files_scroll_handle.clone(),
+                )
+            });
+        let maximum_message_height = git_graph.update_in(cx, |_, window, cx| {
+            editor::hover_markdown_style(window, cx)
+                .base_text_style
+                .line_height_in_pixels(window.rem_size())
+                * 12.
+        });
+
+        for (view_mode, file_count) in [
+            (ChangedFilesViewMode::Tree, 1),
+            (ChangedFilesViewMode::Tree, 20),
+            (ChangedFilesViewMode::Flat, 1),
+            (ChangedFilesViewMode::Flat, 20),
+        ] {
+            git_graph.update(cx, |graph, cx| {
+                graph.changed_files_view_mode = view_mode;
+                graph.selected_commit_diff.as_mut().unwrap().files = (0..file_count)
+                    .map(|index| CommitFile {
+                        path: RepoPath::new(&format!("file-{index}.txt")).unwrap(),
+                        old_text: Some("content".into()),
+                        new_text: Some("updated content".into()),
+                        is_binary: false,
+                    })
+                    .collect();
+                graph.selected_commit_diff_stats = Some((file_count, file_count));
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            // Also exercise a short pane and resizing back to a tall pane.
+            for height in [800., 400., 300., 800.] {
+                cx.simulate_resize(gpui::size(px(1200.), px(height)));
+                cx.run_until_parked();
+
+                let message_bounds = message_scroll_handle.bounds();
+                let changed_files_bounds =
+                    changed_files_scroll_handle.0.borrow().base_handle.bounds();
+
+                assert!(
+                    message_bounds.size.height > px(0.)
+                        && message_bounds.size.height <= maximum_message_height,
+                    "commit message viewport {message_bounds:?} should be visible and bounded at pane height {height}",
+                );
+                assert!(
+                    message_scroll_handle.max_offset().y > px(0.),
+                    "long commit message should be scrollable"
+                );
+                assert!(
+                    message_bounds.bottom() <= changed_files_bounds.top(),
+                    "commit message viewport {message_bounds:?} should not overlap changed files {changed_files_bounds:?}"
+                );
+                let offset_before_scroll = message_scroll_handle.offset();
+                cx.simulate_event(ScrollEvent {
+                    position: message_bounds
+                        .intersect(&gpui::Bounds::new(
+                            point(px(0.), px(0.)),
+                            gpui::size(px(1200.), px(height)),
+                        ))
+                        .center(),
+                    delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-48.))),
+                    modifiers: gpui::Modifiers::default(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                    source: gpui::ScrollSource::Pointer,
+                });
+                cx.run_until_parked();
+                assert!(
+                    message_scroll_handle.offset().y < offset_before_scroll.y,
+                    "scrolling over the commit message should move its contents at pane height {height}",
+                );
+                assert_eq!(
+                    changed_files_scroll_handle.0.borrow().base_handle.bounds(),
+                    changed_files_bounds,
+                    "scrolling the message should not move the changed files, even in a short pane",
+                );
+                assert_eq!(message_scroll_handle.bounds(), message_bounds);
+                // Keep the pointer fixed while reading multiple parts of the message.
+                for _ in 0..3 {
+                    let offset_before_scroll = message_scroll_handle.offset();
+                    cx.simulate_event(ScrollEvent {
+                        position: message_bounds.center(),
+                        delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-48.))),
+                        modifiers: gpui::Modifiers::default(),
+                        touch_phase: gpui::TouchPhase::Moved,
+                        source: gpui::ScrollSource::Pointer,
+                    });
+                    cx.run_until_parked();
+                    assert!(message_scroll_handle.offset().y < offset_before_scroll.y);
+                    assert_eq!(message_scroll_handle.bounds(), message_bounds);
+                }
+
+                let panel_scroll_handle = git_graph
+                    .read_with(&*cx, |graph, _| graph.commit_details_scroll_handle.clone());
+                let panel_bounds = panel_scroll_handle.bounds();
+                assert!(
+                    panel_bounds.top() >= px(0.) && panel_bounds.bottom() <= px(height),
+                    "detail panel {panel_bounds:?} should fit inside pane height {height}",
+                );
+                if height >= 400. {
+                    assert_eq!(panel_scroll_handle.max_offset().y, px(0.));
+                    assert!(
+                        changed_files_bounds.size.height >= px(24.)
+                            && changed_files_bounds.top() >= panel_bounds.top()
+                            && changed_files_bounds.bottom() <= panel_bounds.bottom(),
+                        "changed files {changed_files_bounds:?} should be visible without scrolling detail panel {panel_bounds:?} at pane height {height}; message: {message_bounds:?}",
+                    );
+                    if height == 400. {
+                        assert!(message_bounds.size.height < maximum_message_height);
+                    }
+                }
+                if panel_scroll_handle.max_offset().y > px(0.) {
+                    let maximum_scroll = message_scroll_handle.max_offset().y;
+                    message_scroll_handle.set_offset(point(px(0.), -maximum_scroll + px(10.)));
+                    git_graph.update(cx, |_, cx| cx.notify());
+                    cx.run_until_parked();
+                    // The event that reaches the boundary belongs to the message.
+                    cx.simulate_event(ScrollEvent {
+                        position: message_scroll_handle.bounds().center(),
+                        delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-48.))),
+                        modifiers: gpui::Modifiers::default(),
+                        touch_phase: gpui::TouchPhase::Moved,
+                        source: gpui::ScrollSource::Pointer,
+                    });
+                    cx.run_until_parked();
+                    assert_eq!(message_scroll_handle.offset().y, -maximum_scroll);
+                    assert_eq!(panel_scroll_handle.offset().y, px(0.));
+                    // Further scrolling at the bottom reaches the detail panel.
+                    cx.simulate_event(ScrollEvent {
+                        position: message_scroll_handle.bounds().center(),
+                        delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-24.))),
+                        modifiers: gpui::Modifiers::default(),
+                        touch_phase: gpui::TouchPhase::Moved,
+                        source: gpui::ScrollSource::Pointer,
+                    });
+                    cx.run_until_parked();
+                    assert!(panel_scroll_handle.offset().y < px(0.));
+                    let panel_offset = panel_scroll_handle.offset();
+                    // Reversing direction reads the message, without moving the panel.
+                    cx.simulate_event(ScrollEvent {
+                        position: message_scroll_handle.bounds().center(),
+                        delta: gpui::ScrollDelta::Pixels(point(px(0.), px(24.))),
+                        modifiers: gpui::Modifiers::default(),
+                        touch_phase: gpui::TouchPhase::Moved,
+                        source: gpui::ScrollSource::Pointer,
+                    });
+                    cx.run_until_parked();
+                    assert_eq!(message_scroll_handle.offset().y, -maximum_scroll + px(24.));
+                    assert_eq!(panel_scroll_handle.offset(), panel_offset);
+                    message_scroll_handle.set_offset(point(px(0.), px(0.)));
+                    git_graph.update(cx, |_, cx| cx.notify());
+                    cx.run_until_parked();
+                    cx.simulate_event(ScrollEvent {
+                        position: message_scroll_handle.bounds().center(),
+                        delta: gpui::ScrollDelta::Pixels(point(px(0.), px(24.))),
+                        modifiers: gpui::Modifiers::default(),
+                        touch_phase: gpui::TouchPhase::Moved,
+                        source: gpui::ScrollSource::Pointer,
+                    });
+                    cx.run_until_parked();
+                    assert_eq!(message_scroll_handle.offset().y, px(0.));
+                    assert_eq!(panel_scroll_handle.offset().y, px(0.));
+                }
+                cx.simulate_event(ScrollEvent {
+                    position: panel_bounds.origin + point(px(16.), px(16.)),
+                    delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-1000.))),
+                    modifiers: gpui::Modifiers::default(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                    source: gpui::ScrollSource::Pointer,
+                });
+                cx.run_until_parked();
+
+                let changed_files_bounds =
+                    changed_files_scroll_handle.0.borrow().base_handle.bounds();
+                let footer_bounds = cx
+                    .debug_bounds("view-commit-footer")
+                    .expect("commit footer is rendered");
+                assert!(
+                    changed_files_bounds.size.height >= px(24.)
+                        && changed_files_bounds.top() >= panel_bounds.top()
+                        && changed_files_bounds.bottom() <= panel_bounds.bottom(),
+                    "changed files {changed_files_bounds:?} should be accessible inside detail panel {panel_bounds:?}",
+                );
+                assert!(
+                    footer_bounds.top() >= panel_bounds.top()
+                        && footer_bounds.bottom() <= panel_bounds.bottom(),
+                    "View Commit footer {footer_bounds:?} should be accessible inside detail panel {panel_bounds:?}",
+                );
+                let file_list_handle = changed_files_scroll_handle.0.borrow().base_handle.clone();
+                if file_list_handle.max_offset().y > px(0.) {
+                    let file_offset_before_scroll = file_list_handle.offset();
+                    let panel_offset_before_scroll = panel_scroll_handle.offset();
+                    cx.simulate_event(ScrollEvent {
+                        position: changed_files_bounds.center(),
+                        delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-48.))),
+                        modifiers: gpui::Modifiers::default(),
+                        touch_phase: gpui::TouchPhase::Moved,
+                        source: gpui::ScrollSource::Pointer,
+                    });
+                    cx.run_until_parked();
+                    assert!(
+                        file_list_handle.offset().y < file_offset_before_scroll.y,
+                        "scrolling over the changed files should move the file list",
+                    );
+                    assert_eq!(
+                        panel_scroll_handle.offset(),
+                        panel_offset_before_scroll,
+                        "scrolling the file list should not move the detail panel",
+                    );
+                } else if panel_scroll_handle.offset().y < px(0.) {
+                    let panel_offset_before_scroll = panel_scroll_handle.offset();
+                    cx.simulate_event(ScrollEvent {
+                        position: changed_files_bounds.center(),
+                        delta: gpui::ScrollDelta::Pixels(point(px(0.), px(24.))),
+                        modifiers: gpui::Modifiers::default(),
+                        touch_phase: gpui::TouchPhase::Moved,
+                        source: gpui::ScrollSource::Pointer,
+                    });
+                    cx.run_until_parked();
+                    assert!(
+                        panel_scroll_handle.offset().y > panel_offset_before_scroll.y,
+                        "a file list that fits should allow scrolling the detail panel",
+                    );
+                }
+
+                panel_scroll_handle.set_offset(point(px(0.), px(0.)));
+                git_graph.update(cx, |_, cx| cx.notify());
+                cx.run_until_parked();
+            }
+        }
+
+        for (metadata_collapsed, message_collapsed) in [(false, true), (true, false), (true, true)]
+        {
+            for height in [300., 400.] {
+                git_graph.update(cx, |graph, cx| {
+                    graph.commit_details_metadata_collapsed = metadata_collapsed;
+                    graph.commit_details_message_collapsed = message_collapsed;
+                    graph
+                        .commit_details_scroll_handle
+                        .set_offset(point(px(0.), px(0.)));
+                    cx.notify();
+                });
+                cx.simulate_resize(gpui::size(px(1200.), px(height)));
+                cx.run_until_parked();
+                let panel_scroll_handle = git_graph
+                    .read_with(&*cx, |graph, _| graph.commit_details_scroll_handle.clone());
+                panel_scroll_handle.set_offset(point(px(0.), -panel_scroll_handle.max_offset().y));
+                git_graph.update(cx, |_, cx| cx.notify());
+                cx.run_until_parked();
+                let files_bounds = changed_files_scroll_handle.0.borrow().base_handle.bounds();
+                let footer_bounds = cx.debug_bounds("view-commit-footer").unwrap();
+                assert!(
+                    files_bounds.size.height >= px(24.) && files_bounds.bottom() <= px(height),
+                    "files should remain accessible with metadata collapsed={metadata_collapsed}, message collapsed={message_collapsed}: {files_bounds:?}"
+                );
+                assert!(footer_bounds.bottom() <= px(height));
+                if !message_collapsed {
+                    assert!(message_scroll_handle.bounds().size.height > px(0.));
+                }
+            }
+        }
+        git_graph.update(cx, |graph, cx| {
+            graph.commit_details_metadata_collapsed = false;
+            graph.commit_details_message_collapsed = false;
+            graph
+                .commit_details_scroll_handle
+                .set_offset(point(px(0.), px(0.)));
+            cx.notify();
+        });
+
+        git_graph.update(cx, |graph, cx| {
+            graph.set_selected_commit_message(cx, commit_sha, "Short commit message".into());
+        });
+        for height in [400., 800.] {
+            cx.simulate_resize(gpui::size(px(1200.), px(height)));
+            cx.run_until_parked();
+            let short_message_handle = git_graph.read_with(&*cx, |graph, _| {
+                graph
+                    .selected_commit_message
+                    .as_ref()
+                    .unwrap()
+                    .scroll_handle
+                    .clone()
+            });
+            assert_eq!(short_message_handle.max_offset().y, px(0.));
+            assert!(
+                short_message_handle.bounds().size.height <= maximum_message_height / 12.,
+                "a short message should not reserve the long message viewport",
+            );
+        }
     }
 
     #[gpui::test]
